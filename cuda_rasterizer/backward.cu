@@ -12,7 +12,8 @@
 #include "backward.h"
 #include "auxiliary.h"
 #include <cooperative_groups.h>
-#include <cooperative_groups/reduce.h>
+#include <iostream>
+
 namespace cg = cooperative_groups;
 
 // Backward pass for conversion of spherical harmonics to RGB for
@@ -132,7 +133,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 	// Account for normalization of direction
 	float3 dL_dmean = dnormvdv(float3{ dir_orig.x, dir_orig.y, dir_orig.z }, float3{ dL_ddir.x, dL_ddir.y, dL_ddir.z });
 
-	// Gradients of loss w.r.t. Gaussian means, but only the portion 
+	// Gradients of loss w.r.t. Gaussian means, but only the portion
 	// that is caused because the mean affects the view-dependent color.
 	// Additional mean gradient is accumulated in below methods.
 	dL_dmeans[idx] += glm::vec3(dL_dmean.x, dL_dmean.y, dL_dmean.z);
@@ -159,19 +160,19 @@ __global__ void computeCov2DCUDA(int P,
 	// Reading location of 3D covariance for this Gaussian
 	const float* cov3D = cov3Ds + 6 * idx;
 
-	// Fetch gradients, recompute 2D covariance and relevant 
+	// Fetch gradients, recompute 2D covariance and relevant
 	// intermediate forward results needed in the backward.
 	float3 mean = means[idx];
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
 	float3 t = transformPoint4x3(mean, view_matrix);
-	
+
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
 	const float txtz = t.x / t.z;
 	const float tytz = t.y / t.z;
 	t.x = min(limx, max(-limx, txtz)) * t.z;
 	t.y = min(limy, max(-limy, tytz)) * t.z;
-	
+
 	const float x_grad_mul = txtz < -limx || txtz > limx ? 0 : 1;
 	const float y_grad_mul = tytz < -limy || tytz > limy ? 0 : 1;
 
@@ -211,14 +212,14 @@ __global__ void computeCov2DCUDA(int P,
 		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
 		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
 
-		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
+		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry,
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
 		// cov2D = transpose(T) * transpose(Vrk) * T;
 		dL_dcov[6 * idx + 0] = (T[0][0] * T[0][0] * dL_da + T[0][0] * T[1][0] * dL_db + T[1][0] * T[1][0] * dL_dc);
 		dL_dcov[6 * idx + 3] = (T[0][1] * T[0][1] * dL_da + T[0][1] * T[1][1] * dL_db + T[1][1] * T[1][1] * dL_dc);
 		dL_dcov[6 * idx + 5] = (T[0][2] * T[0][2] * dL_da + T[0][2] * T[1][2] * dL_db + T[1][2] * T[1][2] * dL_dc);
 
-		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
+		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry,
 		// given gradients w.r.t. 2D covariance matrix (off-diagonal).
 		// Off-diagonal elements appear twice --> double the gradient.
 		// cov2D = transpose(T) * transpose(Vrk) * T;
@@ -267,7 +268,7 @@ __global__ void computeCov2DCUDA(int P,
 	// t = transformPoint4x3(mean, view_matrix);
 	float3 dL_dmean = transformVec4x3Transpose({ dL_dtx, dL_dty, dL_dtz }, view_matrix);
 
-	// Gradients of loss w.r.t. Gaussian means, but only the portion 
+	// Gradients of loss w.r.t. Gaussian means, but only the portion
 	// that is caused because the mean affects the covariance matrix.
 	// Additional mean gradient is accumulated in BACKWARD::preprocess.
 	dL_dmeans[idx] = dL_dmean;
@@ -395,10 +396,60 @@ __global__ void preprocessCUDA(
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
 }
 
-// Backward version of the rendering procedure.
+// DISTWAR - serialized atomic reduction (SW-S)
+template<typename ATOM_T>
+__device__ void atomred_vec(size_t idx, ATOM_T** ptr, ATOM_T *val, size_t len, unsigned balance_threshold) {
+    unsigned laneId = (threadIdx.y * blockDim.x + threadIdx.x) & 31;
+
+	// a mask of threads in the warp updating the same primitive
+    unsigned same_mask = __match_any_sync(__activemask(), idx);
+
+	// number of threads in the warp updating the same primitive
+    unsigned same_ct = __popc(same_mask);
+
+	/* if number of threads updating current
+	primitive exceeds balance threshold, perform
+	serialized warp level reduction */
+    if (same_ct >= balance_threshold) {
+		// thread with lowest id becomes the leader
+		unsigned leader = __ffs(same_mask) - 1;
+
+		// leader does not fetch from itself
+		same_mask &= ~(1 << leader);
+
+		/* leader fetch and accumulate all parameters
+    	from threads updating the same primitive */
+        while (same_mask) {
+            unsigned target_lane = __ffs(same_mask) - 1;
+            if (laneId == leader || laneId == target_lane) {
+                unsigned sync_mask = (1 << leader) | (1 << target_lane);
+
+                for (unsigned i = 0; i < len; ++i) {
+                    val[i] += __shfl_sync(sync_mask, val[i], target_lane);
+                }
+            }
+
+            same_mask &= ~(1 << target_lane);
+        }
+
+		// leader sends an atomicAdd per parameter
+        if (laneId == leader) {
+            for (unsigned i = 0; i < len; ++i) {
+                atomicAdd(ptr[i], val[i]);
+            }
+        }
+    } else { // balance threshold not met, update normally
+        for (unsigned i = 0; i < len; ++i) {
+            atomicAdd(ptr[i], val[i]);
+        }
+    }
+}
+
+
+// DISTWAR - backward kernel with serialized atomic reduction (SW-S)
 template <uint32_t C>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
-renderCUDA(
+renderCUDABW_serialized(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -412,7 +463,8 @@ renderCUDA(
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors)
+	float* __restrict__ dL_dcolors,
+	unsigned balance_threshold)
 {
 	// We rasterize again. Compute necessary block info.
 	auto block = cg::this_thread_block();
@@ -437,7 +489,7 @@ renderCUDA(
 	__shared__ float collected_colors[C * BLOCK_SIZE];
 
 	// In the forward, we stored the final value for T, the
-	// product of all (1 - alpha) factors. 
+	// product of all (1 - alpha) factors.
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 	float T = T_final;
 
@@ -455,7 +507,412 @@ renderCUDA(
 	float last_alpha = 0;
 	float last_color[C] = { 0 };
 
-	// Gradient of pixel coordinate w.r.t. normalized 
+	// Gradient of pixel coordinate w.r.t. normalized
+	// screen-space viewport corrdinates (-1 to 1)
+	const float ddelx_dx = 0.5 * W;
+	const float ddely_dy = 0.5 * H;
+
+	// Traverse all Gaussians
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// Load auxiliary data into shared memory, start in the BACK
+		// and load them in revers order.
+		block.sync();
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int coll_id = point_list[range.y - progress - 1];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int i = 0; i < C; i++)
+				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+		}
+		block.sync();
+
+		// Iterate over Gaussians
+		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+		{
+			// Keep track of current Gaussian ID. Skip, if this one
+			// is behind the last contributor for this pixel.
+			contributor--;
+			if (contributor >= last_contributor)
+				continue;
+
+			// Compute blending values, as before.
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				continue;
+
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				continue;
+
+			T = T / (1.f - alpha);
+			const float dchannel_dcolor = alpha * T;
+
+			// Propagate gradients to per-Gaussian colors and keep
+			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+			// pair).
+			float dL_dalpha = 0.0f;
+			const int global_id = collected_id[j];
+			float dcolors[C] = { 0 };
+
+			for (int ch = 0; ch < C; ch++) {
+				const float c = collected_colors[ch * BLOCK_SIZE + j];
+				// Update last color (to be used in the next iteration)
+				accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+				last_color[ch] = c;
+
+				const float dL_dchannel = dL_dpixel[ch];
+				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+
+				// DISTWAR - cache color updates
+				dcolors[ch] = dchannel_dcolor * dL_dchannel;
+			}
+
+
+			dL_dalpha *= T;
+			// Update last alpha (to be used in the next iteration)
+			last_alpha = alpha;
+
+			// Account for fact that alpha also influences how much of
+			// the background color is added if nothing left to blend
+			float bg_dot_dpixel = 0;
+			for (int i = 0; i < C; i++)
+				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+			// Helpful reusable temporary variables
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			float dmeanX = dL_dG * dG_ddelx * ddelx_dx;
+			float dmeanY = dL_dG * dG_ddely * ddely_dy;
+			float dconicX = -0.5f * gdx * d.x * dL_dG;
+			float dconicY = -0.5f * gdx * d.y * dL_dG;
+			float dconicW = -0.5f * gdy * d.y * dL_dG;
+			float dopacity = G * dL_dalpha;
+
+			float *atom_ptrs[9] = {
+				&dL_dmean2D[global_id].x,
+				&dL_dmean2D[global_id].y,
+				&dL_dconic2D[global_id].x,
+				&dL_dconic2D[global_id].y,
+				&dL_dconic2D[global_id].w,
+				&dL_dopacity[global_id],
+				&dL_dcolors[global_id * C + 0],
+				&dL_dcolors[global_id * C + 1],
+				&dL_dcolors[global_id * C + 2]
+			};
+
+			float atom_vals[9] = {
+				dmeanX,
+				dmeanY,
+				dconicX,
+				dconicY,
+				dconicW,
+				dopacity,
+				dcolors[0],
+				dcolors[1],
+				dcolors[2]
+			};
+
+			// DISTWAR - perform all atomic updates using serialized atomic reduction (SW-S)
+			atomred_vec(global_id, atom_ptrs, atom_vals, 9, balance_threshold);
+		}
+	}
+}
+
+// DISTWAR - backward kernel with butterfly atomic reduction (SW-B)
+template <uint32_t C>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDABW_butterfly(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ colors,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ dL_dpixels,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dcolors,
+	unsigned balance_threshold)
+{
+	// We rasterize again. Compute necessary block info.
+	auto block = cg::this_thread_block();
+    const uint32_t laneId = (threadIdx.y * blockDim.x + threadIdx.x) & 31;
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W&& pix.y < H;
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	bool done = !inside;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_colors[C * BLOCK_SIZE];
+
+	// In the forward, we stored the final value for T, the
+	// product of all (1 - alpha) factors.
+	const float T_final = inside ? final_Ts[pix_id] : 0;
+	float T = T_final;
+
+	// We start from the back. The ID of the last contributing
+	// Gaussian is known from each pixel from the forward.
+	uint32_t contributor = toDo;
+	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+
+	float accum_rec[C] = { 0 };
+	float dL_dpixel[C];
+	if (inside)
+		for (int i = 0; i < C; i++)
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+
+	float last_alpha = 0;
+	float last_color[C] = { 0 };
+
+	// Gradient of pixel coordinate w.r.t. normalized
+	// screen-space viewport corrdinates (-1 to 1)
+	const float ddelx_dx = 0.5 * W;
+	const float ddely_dy = 0.5 * H;
+
+	// Traverse all Gaussians
+	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+	{
+		// Load auxiliary data into shared memory, start in the BACK
+		// and load them in revers order.
+		block.sync();
+		const int progress = i * BLOCK_SIZE + block.thread_rank();
+		if (range.x + progress < range.y)
+		{
+			const int coll_id = point_list[range.y - progress - 1];
+			collected_id[block.thread_rank()] = coll_id;
+			collected_xy[block.thread_rank()] = points_xy_image[coll_id];
+			collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+			for (int i = 0; i < C; i++)
+				collected_colors[i * BLOCK_SIZE + block.thread_rank()] = colors[coll_id * C + i];
+		}
+		block.sync();
+
+		// Iterate over Gaussians
+		for (int j = 0; j < min(BLOCK_SIZE, toDo); j++)
+		{
+			__syncwarp();
+			// DISTWAR - instead of allowing threads to continue to next loop iteration
+			//           we instead make these inactive threads also participate in the atomic updates
+			//           we mark these threads by setting this skip flag to true
+			bool skip = done;
+			if (!skip) {
+				// Keep track of current Gaussian ID. Skip, if this one
+				// is behind the last contributor for this pixel.
+				contributor--;
+
+				if (contributor >= last_contributor)
+					skip = true;
+			}
+
+			// Compute blending values, as before.
+			const float2 xy = collected_xy[j];
+			const float2 d = { xy.x - pixf.x, xy.y - pixf.y };
+			const float4 con_o = collected_conic_opacity[j];
+			const float power = -0.5f * (con_o.x * d.x * d.x + con_o.z * d.y * d.y) - con_o.y * d.x * d.y;
+			if (power > 0.0f)
+				skip = true;
+
+			const float G = exp(power);
+			const float alpha = min(0.99f, con_o.w * G);
+			if (alpha < 1.0f / 255.0f)
+				skip = true;
+
+			// DISTWAR - after alpha copmutation, check if there is any active thread
+			//           if there is no active thread, all threads skip to next iteration
+            int active_ct = __popc(__ballot_sync(__activemask(), !skip));
+			if (active_ct == 0) continue;
+
+			if (!skip)
+				T = T / (1.f - alpha);
+			const float dchannel_dcolor = alpha * T;
+
+			// Propagate gradients to per-Gaussian colors and keep
+			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+			// pair).
+			float dL_dalpha = 0.0f;
+			const int global_id = collected_id[j];
+			float dcolors[C] = { 0 };
+
+			if (!skip) {
+				for (int ch = 0; ch < C; ch++) {
+					const float c = collected_colors[ch * BLOCK_SIZE + j];
+					// Update last color (to be used in the next iteration)
+					accum_rec[ch] = last_alpha * last_color[ch] + (1.f - last_alpha) * accum_rec[ch];
+					last_color[ch] = c;
+
+					const float dL_dchannel = dL_dpixel[ch];
+					dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
+
+					// DISTWAR - cache color updates
+					dcolors[ch] = dchannel_dcolor * dL_dchannel;
+				}
+			}
+
+
+			dL_dalpha *= T;
+			// Update last alpha (to be used in the next iteration)
+			if (!skip)
+				last_alpha = alpha;
+
+			// Account for fact that alpha also influences how much of
+			// the background color is added if nothing left to blend
+			float bg_dot_dpixel = 0;
+			for (int i = 0; i < C; i++)
+				bg_dot_dpixel += bg_color[i] * dL_dpixel[i];
+			dL_dalpha += (-T_final / (1.f - alpha)) * bg_dot_dpixel;
+
+
+			// Helpful reusable temporary variables
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			// DISTWAR - inactive threads does not have gradient contribution (set to 0.0f)
+			float dmeanX = skip ? 0.0f : dL_dG * dG_ddelx * ddelx_dx;
+			float dmeanY = skip ? 0.0f : dL_dG * dG_ddely * ddely_dy;
+			float dconicX = skip ? 0.0f : -0.5f * gdx * d.x * dL_dG;
+			float dconicY = skip ? 0.0f : -0.5f * gdx * d.y * dL_dG;
+			float dconicW = skip ? 0.0f : -0.5f * gdy * d.y * dL_dG;
+			float dopacity = skip ? 0.0f : G * dL_dalpha;
+
+			// DISTWAR - butterfly reduction (SW-B) can only be performed if
+			//			 all 32 threads are updating the same gaussian (global_id)
+			//			 and the number of active threads exceeds the preset balance threshold
+			if (__match_any_sync(__activemask(), global_id) == 0xFFFFFFFF && active_ct >= balance_threshold) {
+
+				// DISTWAR - gather the gradient updates to thread 0 with butterfly reduction
+                for (int offset = 16; offset >= 1; offset /= 2) {
+                    dmeanX += __shfl_down_sync(0xFFFFFFFF, dmeanX, offset);
+                    dmeanY += __shfl_down_sync(0xFFFFFFFF, dmeanY, offset);
+                    dconicX += __shfl_down_sync(0xFFFFFFFF, dconicX, offset);
+                    dconicY += __shfl_down_sync(0xFFFFFFFF, dconicY, offset);
+                    dconicW += __shfl_down_sync(0xFFFFFFFF, dconicW, offset);
+                    dopacity += __shfl_down_sync(0xFFFFFFFF, dopacity, offset);
+					dcolors[0] += __shfl_down_sync(0xFFFFFFFF, dcolors[0], offset);
+					dcolors[1] += __shfl_down_sync(0xFFFFFFFF, dcolors[1], offset);
+					dcolors[2] += __shfl_down_sync(0xFFFFFFFF, dcolors[2], offset);
+                }
+
+				// DISTWAR - thread 0 sends the reduced gradient updates with atomicAdd
+                if (laneId == 0) {
+                    atomicAdd(&(dL_dmean2D[global_id].x), dmeanX);
+                    atomicAdd(&(dL_dmean2D[global_id].y), dmeanY);
+                    atomicAdd(&(dL_dconic2D[global_id].x), dconicX);
+                    atomicAdd(&(dL_dconic2D[global_id].y), dconicY);
+                    atomicAdd(&(dL_dconic2D[global_id].w), dconicW);
+                    atomicAdd(&(dL_dopacity[global_id]), dopacity);
+					atomicAdd(&(dL_dcolors[global_id * C + 0]), dcolors[0]);
+					atomicAdd(&(dL_dcolors[global_id * C + 1]), dcolors[1]);
+					atomicAdd(&(dL_dcolors[global_id * C + 2]), dcolors[2]);
+                }
+            } else if (!skip) {		// DISTWAR - SW-B condition not met, update gradients normally
+                atomicAdd(&(dL_dmean2D[global_id].x), dmeanX);
+                atomicAdd(&(dL_dmean2D[global_id].y), dmeanY);
+                atomicAdd(&(dL_dconic2D[global_id].x), dconicX);
+                atomicAdd(&(dL_dconic2D[global_id].y), dconicY);
+                atomicAdd(&(dL_dconic2D[global_id].w), dconicW);
+                atomicAdd(&(dL_dopacity[global_id]), dopacity);
+				atomicAdd(&(dL_dcolors[global_id * C + 0]), dcolors[0]);
+				atomicAdd(&(dL_dcolors[global_id * C + 1]), dcolors[1]);
+				atomicAdd(&(dL_dcolors[global_id * C + 2]), dcolors[2]);
+            }
+		}
+	}
+}
+
+// DISTWAR - Original 3DGS backward kernel implementation
+template <uint32_t C>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+renderCUDABW_original(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ colors,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ dL_dpixels,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* __restrict__ dL_dcolors
+)
+{
+	// We rasterize again. Compute necessary block info.
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+	const uint2 pix_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
+	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
+	const uint32_t pix_id = W * pix.y + pix.x;
+	const float2 pixf = { (float)pix.x, (float)pix.y };
+
+	const bool inside = pix.x < W&& pix.y < H;
+	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	bool done = !inside;
+	int toDo = range.y - range.x;
+
+	__shared__ int collected_id[BLOCK_SIZE];
+	__shared__ float2 collected_xy[BLOCK_SIZE];
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE];
+	__shared__ float collected_colors[C * BLOCK_SIZE];
+
+	// In the forward, we stored the final value for T, the
+	// product of all (1 - alpha) factors.
+	const float T_final = inside ? final_Ts[pix_id] : 0;
+	float T = T_final;
+
+	// We start from the back. The ID of the last contributing
+	// Gaussian is known from each pixel from the forward.
+	uint32_t contributor = toDo;
+	const int last_contributor = inside ? n_contrib[pix_id] : 0;
+
+	float accum_rec[C] = { 0 };
+	float dL_dpixel[C];
+	if (inside)
+		for (int i = 0; i < C; i++)
+			dL_dpixel[i] = dL_dpixels[i * H * W + pix_id];
+
+	float last_alpha = 0;
+	float last_color[C] = { 0 };
+
+	// Gradient of pixel coordinate w.r.t. normalized
 	// screen-space viewport corrdinates (-1 to 1)
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
@@ -517,7 +974,7 @@ renderCUDA(
 
 				const float dL_dchannel = dL_dpixel[ch];
 				dL_dalpha += (c - accum_rec[ch]) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
+				// Update the gradients w.r.t. color of the Gaussian.
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
 				atomicAdd(&(dL_dcolors[global_id * C + ch]), dchannel_dcolor * dL_dchannel);
@@ -580,11 +1037,11 @@ void BACKWARD::preprocess(
 	glm::vec3* dL_dscale,
 	glm::vec4* dL_drot)
 {
-	// Propagate gradients for the path of 2D conic matrix computation. 
-	// Somewhat long, thus it is its own kernel rather than being part of 
+	// Propagate gradients for the path of 2D conic matrix computation.
+	// Somewhat long, thus it is its own kernel rather than being part of
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
-	// modified and gradient w.r.t. 3D covariance matrix has been computed.	
-	computeCov2DCUDA << <(P + 255) / 256, 256 >> > (
+	// modified and gradient w.r.t. 3D covariance matrix has been computed.
+	computeCov2DCUDA <<<(P + 255) / 256, 256 >>> (
 		P,
 		means3D,
 		radii,
@@ -601,7 +1058,7 @@ void BACKWARD::preprocess(
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
-	preprocessCUDA<NUM_CHANNELS> << < (P + 255) / 256, 256 >> > (
+	preprocessCUDA<NUM_CHANNELS> <<< (P + 255) / 256, 256 >>> (
 		P, D, M,
 		(float3*)means3D,
 		radii,
@@ -621,6 +1078,10 @@ void BACKWARD::preprocess(
 		dL_drot);
 }
 
+unsigned ct = 0;
+unsigned balance_threshold = 9999999;
+unsigned bw_impl = 9999999;
+
 void BACKWARD::render(
 	const dim3 grid, const dim3 block,
 	const uint2* ranges,
@@ -638,20 +1099,109 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
-	renderCUDA<NUM_CHANNELS> << <grid, block >> >(
-		ranges,
-		point_list,
-		W, H,
-		bg_color,
-		means2D,
-		conic_opacity,
-		colors,
-		final_Ts,
-		n_contrib,
-		dL_dpixels,
-		dL_dmean2D,
-		dL_dconic2D,
-		dL_dopacity,
-		dL_dcolors
+    ++ct;
+    bool pt = ct >= 10000 && ct <= 10000;
+
+	if (ct == 1) {
+		char * balance_threshold_str = std::getenv("BALANCE_THRESHOLD");
+		balance_threshold = 0;
+		if (balance_threshold_str != nullptr) {
+			balance_threshold = std::atoi(balance_threshold_str);
+			assert(balance_threshold <= 32);
+		}
+
+		char * bw_impl_str = std::getenv("BW_IMPLEMENTATION");
+		bw_impl = 0;
+		if (bw_impl_str != nullptr) {
+			bw_impl = std::atoi(bw_impl_str);
+			assert(bw_impl <= 4);
+		}
+	}
+
+    if (ct == 1) {
+        std::cout << "\n=======================" << std::endl;
+    }
+
+	switch(bw_impl) {
+		case 0:
+		if (ct == 1) {
+			std::cout << "BW IMPLEMENTATION: ORIGINAL (no optimization)\n";
+		}
+		renderCUDABW_original<NUM_CHANNELS> <<<grid, block >>>(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			final_Ts,
+			n_contrib,
+			dL_dpixels,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_dopacity,
+			dL_dcolors
 		);
+		break;
+
+		case 1:
+		if (ct == 1) {
+			std::cout << "BW IMPLEMENTATION: BUTTERFLY (SW-B)\n";
+		}
+		renderCUDABW_butterfly<NUM_CHANNELS> <<<grid, block >>>(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			final_Ts,
+			n_contrib,
+			dL_dpixels,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_dopacity,
+			dL_dcolors,
+			balance_threshold
+		);
+		break;
+
+		case 2:
+		if (ct == 1) {
+			std::cout << "BW IMPLEMENTATION: SERIALIZED (SW-S)\n";
+		}
+		renderCUDABW_serialized<NUM_CHANNELS> <<<grid, block >>>(
+			ranges,
+			point_list,
+			W, H,
+			bg_color,
+			means2D,
+			conic_opacity,
+			colors,
+			final_Ts,
+			n_contrib,
+			dL_dpixels,
+			dL_dmean2D,
+			dL_dconic2D,
+			dL_dopacity,
+			dL_dcolors,
+			balance_threshold
+		);
+		break;
+
+		default:
+		std::cout << "ERROR: Undefined backward kernel implementation " << bw_impl << ". Please fix environment variable BW_IMPLEMENTATION to valid value.\n";
+		std::cout << "BW_IMPLEMENTATION modes:\n" <<
+		"0: original 3DGS implementation\n" <<
+		"1: SW-B butterfly atomic reduction\n" <<
+		"2: SW-S serialized atomic reduction" << std::endl;
+		assert(0);
+		break;
+	}
+	if (ct == 1) {
+		std::cout << "BALANCE_THRESHOLD: " << balance_threshold << std::endl;
+		std::cout << "=======================\n" << std::endl;
+	}
 }
