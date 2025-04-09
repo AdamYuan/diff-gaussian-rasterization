@@ -399,7 +399,6 @@ void CudaRasterizer::Rasterizer::backward(
 		color_ptr,
 		imgState.accum_alpha,
 		imgState.n_contrib,
-		geomState.tiles_touched,
 		dL_dpix,
 		(float3*)dL_dmean2D,
 		(float4*)dL_dconic,
