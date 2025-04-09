@@ -1078,9 +1078,9 @@ void BACKWARD::preprocess(
 		dL_drot);
 }
 
-unsigned ct = 0;
-unsigned balance_threshold = 9999999;
-unsigned bw_impl = 9999999;
+unsigned ct = 1;
+unsigned balance_threshold = 8;
+unsigned bw_impl = 1;
 
 void BACKWARD::render(
 	const dim3 grid, const dim3 block,
@@ -1099,10 +1099,7 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors)
 {
-    ++ct;
-    bool pt = ct >= 10000 && ct <= 10000;
-
-	if (ct == 1) {
+	/* if (ct == 1) {
 		char * balance_threshold_str = std::getenv("BALANCE_THRESHOLD");
 		balance_threshold = 0;
 		if (balance_threshold_str != nullptr) {
@@ -1116,7 +1113,7 @@ void BACKWARD::render(
 			bw_impl = std::atoi(bw_impl_str);
 			assert(bw_impl <= 4);
 		}
-	}
+	} */
 
     if (ct == 1) {
         std::cout << "\n=======================" << std::endl;
