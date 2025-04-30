@@ -344,7 +344,7 @@ renderCUDA(
 			if (alpha < 1.0f / 255.0f)
 				continue;
 			float test_T = T * (1 - alpha);
-			if (T < 0.0001f)
+			if (false/*T < 0.0001f*/)
 			{
 				done = true;
 				continue;
