@@ -20,6 +20,28 @@ namespace CudaRasterizer
 	class Rasterizer
 	{
 	public:
+		struct PerfMetrics {
+			float forward, forwardView, forwardAlloc, forwardSort, forwardDraw;
+			float backward, backwardDraw, backwardView;
+		};
+		struct PerfQuery {
+			enum Event : uint32_t {
+				kForward,
+				kForwardView,
+				kForwardAlloc,
+				kForwardSort,
+				kForwardDraw,
+				kBackward,
+				kBackwardDraw,
+				kBackwardView,
+				kEventCount,
+			};
+			std::array<uintptr_t, kEventCount> events;
+
+			static PerfQuery Create();
+			void Record(Event event) const;
+			PerfMetrics GetMetrics() const;
+		};
 
 		static void markVisible(
 			int P,
@@ -50,7 +72,8 @@ namespace CudaRasterizer
 			const bool prefiltered,
 			float* out_color,
 			int* radii = nullptr,
-			bool debug = false);
+			bool debug = false,
+			PerfQuery perfQuery = {});
 
 		static void backward(
 			const int P, int D, int M, int R,
@@ -81,7 +104,8 @@ namespace CudaRasterizer
 			float* dL_dsh,
 			float* dL_dscale,
 			float* dL_drot,
-			bool debug);
+			bool debug,
+			PerfQuery perfQuery = {});
 	};
 };
 
