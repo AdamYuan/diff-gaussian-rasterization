@@ -361,7 +361,7 @@ __global__ void preprocessCUDA(
 	const float* view_matrix,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
-	const float4* dL_dconics,
+	const float* dL_dconics,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float* dL_dcov3D,
@@ -374,24 +374,25 @@ __global__ void preprocessCUDA(
 		return;
 
 	auto fScales = (const float3 *)scales;
-	auto fRotates = (const float4 *)rotations;
 	auto fSHs = (const math::SH_0 *)shs;
 	auto fDL_DColors = (const float3 *)dL_dcolor;
 	auto fCamPos = (const float3 *)campos;
 
 	auto fDL_DMeans = (float3 *)dL_dmeans;
 	auto fDL_DScales = (float3 *)dL_dscale;
-	auto fDL_DRotates = (float4 *)dL_drot;
 	auto fDL_DSHs = (math::SH_0 *)dL_dsh;
 
 	static_assert(sizeof(float3) == sizeof(glm::vec3));
+	static_assert(alignof(float3) == alignof(glm::vec3));
 	static_assert(sizeof(float4) == sizeof(glm::vec4));
+	// static_assert(alignof(float4) == alignof(glm::vec4));
 	static_assert(sizeof(math::SH_0) == 16 * sizeof(float3));
+	static_assert(alignof(math::SH_0) == alignof(float));
 
 	math::Splat_0 splat{};
 	splat.geom_1.mean_0 = means[idx];
 	splat.geom_1.opacity_1 = 1.0f;
-	splat.geom_1.quat_0 = fRotates[idx];
+	splat.geom_1.quat_0 = {rotations[idx].x, rotations[idx].y, rotations[idx].z, rotations[idx].w};
 	splat.geom_1.scale_0 = fScales[idx];
 	splat.sh_0 = fSHs[idx];
 
@@ -412,15 +413,15 @@ __global__ void preprocessCUDA(
 	dL_dSplatView.geom_0.opacity_0 = 0.0f;
 	dL_dSplatView.geom_0.mean2D_0.x = dL_dmean2D[idx].x / (float(W) * 0.5f);
 	dL_dSplatView.geom_0.mean2D_0.y = dL_dmean2D[idx].y / (float(H) * 0.5f);
-	dL_dSplatView.geom_0.conic_0.x = dL_dconics[idx].x;
-	dL_dSplatView.geom_0.conic_0.y = dL_dconics[idx].y * 2.0f;
-	dL_dSplatView.geom_0.conic_0.z = dL_dconics[idx].w;
+	dL_dSplatView.geom_0.conic_0.x = dL_dconics[idx * 4 + 0];
+	dL_dSplatView.geom_0.conic_0.y = dL_dconics[idx * 4 + 1] * 2.0f;
+	dL_dSplatView.geom_0.conic_0.z = dL_dconics[idx * 4 + 3];
 
 	math::Splat_0 dL_dSplat = math::bwd_splat2splatView_0(splat, camera, dL_dSplatView);
 
 	fDL_DMeans[idx] = dL_dSplat.geom_1.mean_0;
 	fDL_DScales[idx] = dL_dSplat.geom_1.scale_0;
-	fDL_DRotates[idx] = dL_dSplat.geom_1.quat_0;
+	dL_drot[idx] = {dL_dSplat.geom_1.quat_0.x, dL_dSplat.geom_1.quat_0.y, dL_dSplat.geom_1.quat_0.z, dL_dSplat.geom_1.quat_0.w};
 	fDL_DSHs[idx].data_0[0] = dL_dSplat.sh_0.data_0[0];
 
 #if 0
@@ -1134,7 +1135,7 @@ void BACKWARD::preprocess(
 		viewmatrix,
 		campos,
 		(float3*)dL_dmean2D,
-		(const float4 *)dL_dconic,
+		dL_dconic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
