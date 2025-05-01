@@ -3,14 +3,15 @@
  * GRAPHDECO research group, https://team.inria.fr/graphdeco
  * All rights reserved.
  *
- * This software is free for non-commercial, research and evaluation use 
+ * This software is free for non-commercial, research and evaluation use
  * under the terms of the LICENSE.md file.
  *
  * For inquiries contact  george.drettakis@inria.fr
  */
 
-#include "backward.h"
+#include "Math.cuh"
 #include "auxiliary.h"
+#include "backward.h"
 #include <cooperative_groups.h>
 #include <iostream>
 
@@ -140,7 +141,7 @@ __device__ void computeColorFromSH(int idx, int deg, int max_coeffs, const glm::
 }
 
 // Backward version of INVERSE 2D covariance matrix computation
-// (due to length launched as separate kernel before other 
+// (due to length launched as separate kernel before other
 // backward steps contained in preprocess)
 __global__ void computeCov2DCUDA(int P,
 	const float3* means,
@@ -274,8 +275,8 @@ __global__ void computeCov2DCUDA(int P,
 	dL_dmeans[idx] = dL_dmean;
 }
 
-// Backward pass for the conversion of scale and rotation to a 
-// 3D covariance matrix for each Gaussian. 
+// Backward pass for the conversion of scale and rotation to a
+// 3D covariance matrix for each Gaussian.
 __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const glm::vec4 rot, const float* dL_dcov3Ds, glm::vec3* dL_dscales, glm::vec4* dL_drots)
 {
 	// Recompute (intermediate) results for the 3D covariance computation.
@@ -347,6 +348,7 @@ __device__ void computeCov3D(int idx, const glm::vec3 scale, float mod, const gl
 template<int C>
 __global__ void preprocessCUDA(
 	int P, int D, int M,
+	int W, int H,
 	const float3* means,
 	const int* radii,
 	const float* shs,
@@ -355,8 +357,11 @@ __global__ void preprocessCUDA(
 	const glm::vec4* rotations,
 	const float scale_modifier,
 	const float* proj,
+	const float tan_fovx, float tan_fovy,
+	const float* view_matrix,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
+	const float4* dL_dconics,
 	glm::vec3* dL_dmeans,
 	float* dL_dcolor,
 	float* dL_dcov3D,
@@ -368,11 +373,63 @@ __global__ void preprocessCUDA(
 	if (idx >= P || !(radii[idx] > 0))
 		return;
 
+	auto fScales = (const float3 *)scales;
+	auto fRotates = (const float4 *)rotations;
+	auto fSHs = (const math::SH_0 *)shs;
+	auto fDL_DColors = (const float3 *)dL_dcolor;
+	auto fCamPos = (const float3 *)campos;
+
+	auto fDL_DMeans = (float3 *)dL_dmeans;
+	auto fDL_DScales = (float3 *)dL_dscale;
+	auto fDL_DRotates = (float4 *)dL_drot;
+	auto fDL_DSHs = (math::SH_0 *)dL_dsh;
+
+	static_assert(sizeof(float3) == sizeof(glm::vec3));
+	static_assert(sizeof(float4) == sizeof(glm::vec4));
+	static_assert(sizeof(math::SH_0) == 16 * sizeof(float3));
+
+	math::Splat_0 splat{};
+	splat.geom_1.mean_0 = means[idx];
+	splat.geom_1.opacity_1 = 1.0f;
+	splat.geom_1.quat_0 = fRotates[idx];
+	splat.geom_1.scale_0 = fScales[idx];
+	splat.sh_0 = fSHs[idx];
+
+	math::Camera_0 camera{};
+	camera.focal_0.x = (float(W) * 0.5f) / tan_fovx;
+	camera.focal_0.y = (float(H) * 0.5f) / tan_fovy;
+	camera.resolution_0.x = W;
+	camera.resolution_0.y = H;
+	camera.pos_0 = fCamPos[0];
+	for (uint32_t i = 0; i < 3; ++i) {
+		camera.viewMat_0[i].x = view_matrix[i + 0];
+		camera.viewMat_0[i].y = view_matrix[i + 4];
+		camera.viewMat_0[i].z = view_matrix[i + 8];
+	}
+
+	math::SplatView_0 dL_dSplatView{};
+	dL_dSplatView.color_0 = fDL_DColors[idx];
+	dL_dSplatView.geom_0.opacity_0 = 0.0f;
+	dL_dSplatView.geom_0.mean2D_0.x = dL_dmean2D[idx].x / (float(W) * 0.5f);
+	dL_dSplatView.geom_0.mean2D_0.y = dL_dmean2D[idx].y / (float(H) * 0.5f);
+	dL_dSplatView.geom_0.conic_0.x = dL_dconics[idx].x;
+	dL_dSplatView.geom_0.conic_0.y = dL_dconics[idx].y * 2.0f;
+	dL_dSplatView.geom_0.conic_0.z = dL_dconics[idx].w;
+
+	math::Splat_0 dL_dSplat = math::bwd_splat2splatView_0(splat, camera, dL_dSplatView);
+
+	fDL_DMeans[idx] = dL_dSplat.geom_1.mean_0;
+	fDL_DScales[idx] = dL_dSplat.geom_1.scale_0;
+	fDL_DRotates[idx] = dL_dSplat.geom_1.quat_0;
+	fDL_DSHs[idx].data_0[0] = dL_dSplat.sh_0.data_0[0];
+
+#if 0
 	float3 m = means[idx];
 
 	// Taking care of gradients from the screenspace points
 	float4 m_hom = transformPoint4x4(m, proj);
-	float m_w = 1.0f / (m_hom.w + 0.0000001f);
+	// float m_w = 1.0f / (m_hom.w + 0.0000001f);
+	float m_w = 1.0f / m_hom.w;
 
 	// Compute loss gradient w.r.t. 3D means due to gradients of 2D means
 	// from rendering procedure
@@ -394,6 +451,9 @@ __global__ void preprocessCUDA(
 	// Compute gradient updates due to computing covariance from scale/rotation
 	if (scales)
 		computeCov3D(idx, scales[idx], scale_modifier, rotations[idx], dL_dcov3D, dL_dscale, dL_drot);
+
+	// dL_dmeans[idx] = glm::vec3{dL_dmean2D[idx].x, dL_dmean2D[idx].y, 0.0f};
+#endif
 }
 
 // DISTWAR - serialized atomic reduction (SW-S)
@@ -1015,6 +1075,7 @@ renderCUDABW_original(
 
 void BACKWARD::preprocess(
 	int P, int D, int M,
+	int W, int H,
 	const float3* means3D,
 	const int* radii,
 	const float* shs,
@@ -1041,7 +1102,7 @@ void BACKWARD::preprocess(
 	// Somewhat long, thus it is its own kernel rather than being part of
 	// "preprocess". When done, loss gradient w.r.t. 3D means has been
 	// modified and gradient w.r.t. 3D covariance matrix has been computed.
-	computeCov2DCUDA <<<(P + 255) / 256, 256 >>> (
+	/* computeCov2DCUDA <<<(P + 255) / 256, 256 >>> (
 		P,
 		means3D,
 		radii,
@@ -1053,13 +1114,14 @@ void BACKWARD::preprocess(
 		viewmatrix,
 		dL_dconic,
 		(float3*)dL_dmean3D,
-		dL_dcov3D);
+		dL_dcov3D); */
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
 	// matrix gradients to scale and rotation.
 	preprocessCUDA<NUM_CHANNELS> <<< (P + 255) / 256, 256 >>> (
 		P, D, M,
+		W, H,
 		(float3*)means3D,
 		radii,
 		shs,
@@ -1068,8 +1130,11 @@ void BACKWARD::preprocess(
 		(glm::vec4*)rotations,
 		scale_modifier,
 		projmatrix,
+		tan_fovx, tan_fovy,
+		viewmatrix,
 		campos,
 		(float3*)dL_dmean2D,
+		(const float4 *)dL_dconic,
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
