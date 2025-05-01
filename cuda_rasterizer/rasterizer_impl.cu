@@ -192,8 +192,7 @@ __global__ void duplicateWithKeys(
 // Check keys to see if it is at the start/end of one tile's range in 
 // the full sorted list. If yes, write start/end of this tile. 
 // Run once per instanced (duplicated) Gaussian ID.
-__global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* ranges)
-{
+__global__ void identifyTileRanges(int L, uint64_t *point_list_keys, uint2 *ranges) {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= L)
 		return;
@@ -205,11 +204,9 @@ __global__ void identifyTileRanges(int L, uint64_t* point_list_keys, uint2* rang
 
 	if (idx == 0)
 		ranges[currtile].x = 0;
-	else
-	{
+	else {
 		uint32_t prevtile = point_list_keys[idx - 1] >> 32;
-		if (currtile != prevtile)
-		{
+		if (currtile != prevtile) {
 			ranges[prevtile].y = idx;
 			if (valid_tile) 
 			ranges[currtile].x = idx;
@@ -229,6 +226,36 @@ __global__ void perTileBucketCount(int T, uint2* ranges, uint32_t* bucketCount) 
 	int num_splats = range.y - range.x;
 	int num_buckets = (num_splats + 31) / 32;
 	bucketCount[idx] = (uint32_t) num_buckets;
+}
+
+CudaRasterizer::Rasterizer::PerfQuery CudaRasterizer::Rasterizer::PerfQuery::Create() {
+	PerfQuery query{};
+	for (uint32_t i = 0; i < kEventCount; ++i) {
+		cudaEvent_t event;
+		cudaEventCreate(&event);
+		query.events[i] = (uintptr_t)event;
+	}
+	return query;
+}
+void CudaRasterizer::Rasterizer::PerfQuery::Record(Event event) const {
+	if (events[event])
+		cudaEventRecord((cudaEvent_t)events[event]);
+}
+CudaRasterizer::Rasterizer::PerfMetrics CudaRasterizer::Rasterizer::PerfQuery::GetMetrics() const {
+	for (uint32_t i = 0; i < kEventCount; ++i)
+		cudaEventSynchronize((cudaEvent_t)events[i]);
+
+	PerfMetrics metrics{};
+	cudaEventElapsedTime(&metrics.forward, (cudaEvent_t)events[kForward], (cudaEvent_t)events[kForwardDraw]);
+	cudaEventElapsedTime(&metrics.forwardView, (cudaEvent_t)events[kForward], (cudaEvent_t)events[kForwardView]);
+	cudaEventElapsedTime(&metrics.forwardAlloc, (cudaEvent_t)events[kForwardView], (cudaEvent_t)events[kForwardAlloc]);
+	cudaEventElapsedTime(&metrics.forwardSort, (cudaEvent_t)events[kForwardAlloc], (cudaEvent_t)events[kForwardSort]);
+	cudaEventElapsedTime(&metrics.forwardDraw, (cudaEvent_t)events[kForwardSort], (cudaEvent_t)events[kForwardDraw]);
+	cudaEventElapsedTime(&metrics.backward, (cudaEvent_t)events[kBackward], (cudaEvent_t)events[kBackwardView]);
+	cudaEventElapsedTime(&metrics.backwardDraw, (cudaEvent_t)events[kBackward], (cudaEvent_t)events[kBackwardDraw]);
+	cudaEventElapsedTime(&metrics.backwardView, (cudaEvent_t)events[kBackwardDraw], (cudaEvent_t)events[kBackwardView]);
+
+	return metrics;
 }
 
 // Mark Gaussians as visible/invisible, based on view frustum testing
@@ -366,7 +393,10 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	int* reverse_count,
 	float* blend_weights,
 	float* dist_accum)
+	PerfQuery perfQuery)
 {
+	perfQuery.Record(PerfQuery::Event::kForward);
+
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
@@ -430,9 +460,13 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
+	perfQuery.Record(PerfQuery::Event::kForwardView);
+
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	perfQuery.Record(PerfQuery::Event::kForwardAlloc);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
@@ -458,6 +492,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_keys_unsorted, binningState.point_list_keys,
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
+
+	perfQuery.Record(PerfQuery::Event::kForwardSort);
 
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
@@ -510,6 +546,9 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		dist_accum), debug)
 
 	return std::make_tuple(num_rendered, bucket_sum);
+	perfQuery.Record(PerfQuery::Event::kForwardDraw);
+
+	return num_rendered;
 }
 
 // Produce necessary gradients for optimization, corresponding
@@ -546,8 +585,11 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
-	bool debug)
+	bool debug,
+	PerfQuery perfQuery)
 {
+	perfQuery.Record(PerfQuery::Event::kBackward);
+
 	GeometryState geomState = GeometryState::fromChunk(geom_buffer, P);
 	BinningState binningState = BinningState::fromChunk(binning_buffer, R);
 	ImageState imgState = ImageState::fromChunk(img_buffer, width * height);
@@ -592,6 +634,8 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor), debug)
 
+	perfQuery.Record(PerfQuery::Event::kBackwardDraw);
+
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
 	// use the one we computed ourselves.
@@ -620,4 +664,6 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot), debug)
+
+	perfQuery.Record(PerfQuery::Event::kBackwardView);
 }
