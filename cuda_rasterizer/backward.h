@@ -16,6 +16,7 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 #define GLM_FORCE_CUDA
+#include <cuda_fp16.h>
 #include <glm/glm.hpp>
 
 namespace BACKWARD
@@ -29,7 +30,7 @@ namespace BACKWARD
 		const float2* means2D,
 		const float4* conic_opacity,
 		const float* colors,
-		const float* final_Ts,
+		const half* final_Ts,
 		const uint32_t* n_contrib,
 		const float* dL_dpixels,
 		float3* dL_dmean2D,
