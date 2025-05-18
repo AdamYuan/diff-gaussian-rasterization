@@ -12,6 +12,7 @@
 #ifndef CUDA_RASTERIZER_H_INCLUDED
 #define CUDA_RASTERIZER_H_INCLUDED
 
+#include <array>
 #include <vector>
 #include <functional>
 
