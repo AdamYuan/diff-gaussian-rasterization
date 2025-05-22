@@ -74,7 +74,8 @@ namespace CudaRasterizer
 			float* out_color,
 			int* radii = nullptr,
 			bool debug = false,
-			PerfQuery perfQuery = {});
+			PerfQuery perfQuery = {},
+			bool alloc_only = false);
 
 		static void backward(
 			const int P, int D, int M, int R,
