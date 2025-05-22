@@ -380,7 +380,8 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	int* radii,
 	bool debug,
-	PerfQuery perfQuery)
+	PerfQuery perfQuery,
+	bool alloc_only)
 {
 	perfQuery.Record(PerfQuery::Event::kForward);
 
@@ -450,6 +451,9 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+
+	if (alloc_only)
+		return num_rendered;
 
 	perfQuery.Record(PerfQuery::Event::kForwardAlloc);
 
