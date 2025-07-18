@@ -357,22 +357,14 @@ __global__ void set(int N, uint32_t* where, int* space)
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
-	float2* xy_d,
-    float *depths_d,
-	int *radii_d,
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
 	std::function<char* (size_t)> imageBuffer,
 	std::function<char* (size_t)> sampleBuffer,
-	std::function<int* (size_t)> listBuffer,
-	std::function<float* (size_t)> listBufferRender,
-	std::function<float* (size_t)> listBufferDistance,
-	int* contribCountBuffer, int* contribOffsetBuffer,
 	const int P, int D, int M,
 	const float* background,
 	const int width, int height,
 	const float* means3D,
-	const float* dc,
 	const float* shs,
 	const float* colors_precomp,
 	const float* opacities,
@@ -388,11 +380,6 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	float* out_color,
 	int* radii,
 	bool debug,
-	float* pixel_weights,
-	float* accum_weights,
-	int* reverse_count,
-	float* blend_weights,
-	float* dist_accum)
 	PerfQuery perfQuery)
 {
 	perfQuery.Record(PerfQuery::Event::kForward);
@@ -424,14 +411,12 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::preprocess(
-		xy_d, depths_d, radii_d,
 		P, D, M,
 		means3D,
 		(glm::vec3*)scales,
 		scale_modifier,
 		(glm::vec4*)rotations,
 		opacities,
-		dc,
 		shs,
 		geomState.clamped,
 		cov3D_precomp,
@@ -533,22 +518,12 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		imgState.max_contrib,
 		imgState.pixel_colors,
 		background,
-		out_color,
-		contribCountBuffer,
-		contribOffsetBuffer,
-		imgState.contrib_scan,
-		imgState.scan_size,
-		listBuffer, listBufferRender, listBufferDistance,
-		pixel_weights,
-		accum_weights,
-		reverse_count,
-		blend_weights,
-		dist_accum), debug)
+		out_color
+		), debug)
 
-	return std::make_tuple(num_rendered, bucket_sum);
 	perfQuery.Record(PerfQuery::Event::kForwardDraw);
 
-	return num_rendered;
+	return std::make_tuple(num_rendered, bucket_sum);
 }
 
 // Produce necessary gradients for optimization, corresponding
@@ -558,7 +533,6 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* background,
 	const int width, int height,
 	const float* means3D,
-	const float* dc,
 	const float* shs,
 	const float* colors_precomp,
 	const float* scales,
@@ -581,7 +555,6 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dcolor,
 	float* dL_dmean3D,
 	float* dL_dcov3D,
-	float* dL_ddc,
 	float* dL_dsh,
 	float* dL_dscale,
 	float* dL_drot,
@@ -615,7 +588,7 @@ void CudaRasterizer::Rasterizer::backward(
 		block,
 		imgState.ranges,
 		binningState.point_list,
-		width, height, R, B,
+		width, height, R,
 		imgState.bucket_offsets,
 		sampleState.bucket_to_tile,
 		sampleState.T,
@@ -643,7 +616,6 @@ void CudaRasterizer::Rasterizer::backward(
 	CHECK_CUDA(BACKWARD::preprocess(P, D, M,
 		(float3*)means3D,
 		radii,
-		dc,
 		shs,
 		geomState.clamped,
 		(glm::vec3*)scales,
@@ -660,7 +632,6 @@ void CudaRasterizer::Rasterizer::backward(
 		(glm::vec3*)dL_dmean3D,
 		dL_dcolor,
 		dL_dcov3D,
-		dL_ddc,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
 		(glm::vec4*)dL_drot), debug)
