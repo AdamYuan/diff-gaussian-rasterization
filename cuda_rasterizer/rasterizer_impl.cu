@@ -452,9 +452,6 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
-	if (alloc_only)
-		return num_rendered;
-
 	perfQuery.Record(PerfQuery::Event::kForwardAlloc);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
@@ -505,6 +502,9 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 	char* sample_chunkptr = sampleBuffer(sample_chunk_size);
 	SampleState sampleState = SampleState::fromChunk(sample_chunkptr, bucket_sum);
 
+	if (alloc_only)
+		return {num_rendered, bucket_sum};
+
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	CHECK_CUDA(FORWARD::render(
@@ -527,7 +527,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 
 	perfQuery.Record(PerfQuery::Event::kForwardDraw);
 
-	return std::make_tuple(num_rendered, bucket_sum);
+	return {num_rendered, bucket_sum};
 }
 
 // Produce necessary gradients for optimization, corresponding
